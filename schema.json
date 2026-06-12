@@ -16,5 +16,11 @@
     "type": "switch",
     "default": true,
     "hint": "如果没有 <msg> 根标签，自动添加"
+  },
+  "fix_double_brackets": {
+    "name": "修复双尖括号",
+    "type": "switch",
+    "default": true,
+    "hint": "将 <<msg 修复为 <msg, <<function_calls 修复为 <function_calls 等"
   }
 }
