@@ -11,7 +11,7 @@ class XmlTagFixerPlugin(BasePlugin):
         self.enabled = cfg.get("enabled", True)
         self.only_final = cfg.get("only_final_message", True)
         self.fix_missing_msg = cfg.get("fix_missing_msg", True)
-        self.fix_double_brackets = cfg.get("fix_double_brackets", True)  # 只修复双尖括号
+        self.fix_double_brackets = cfg.get("fix_double_brackets", True)
         self.IGNORE_TAGS = {
             "file", "record", "video", "image", "sticker", "forward", "reply", "reasoning",
             "at", "face", "json", "lightapp", "animation", "poke", "node", "location", "share",
@@ -27,10 +27,13 @@ class XmlTagFixerPlugin(BasePlugin):
 
     def _preprocess(self, xml_str: str) -> str:
         """修复双尖括号错误"""
-        if self.fix_double_brackets:
-            # 修复 <<msg -> <msg, <<function_calls -> <function_calls 等
-            xml_str = re.sub(r'<<(\w+)', r'<\1', xml_str)
-        return xml_str
+        if not self.fix_double_brackets:
+            return xml_str
+        # 使用更宽泛的匹配：<<后面跟任意非空字符（但为了安全，只替换标签名）
+        new_str = re.sub(r'<<(\w+)', r'<\1', xml_str)
+        if new_str != xml_str:
+            logger.debug(f"双尖括号修复: {xml_str[:80]} -> {new_str[:80]}")
+        return new_str
 
     def _wrap_text_in_element(self, elem: ET.Element) -> bool:
         """递归修复元素内部及尾随的裸文本，跳过忽略标签"""
@@ -65,6 +68,10 @@ class XmlTagFixerPlugin(BasePlugin):
 
     def _fix_single_msg(self, msg_str: str) -> list[str]:
         """返回修复后的消息列表（可能拆分多个）"""
+        # 先修复双尖括号（兜底）
+        if self.fix_double_brackets:
+            msg_str = re.sub(r'<<(\w+)', r'<\1', msg_str)
+
         has_poke = "<poke" in msg_str and "</poke>" in msg_str
         has_text = "<text" in msg_str and "</text>" in msg_str
         if has_poke and has_text:
@@ -118,7 +125,7 @@ class XmlTagFixerPlugin(BasePlugin):
                 return [msg_str]
 
     def fix_xml(self, xml_str: str) -> str:
-        # 先预处理双尖括号
+        # 预处理全局双尖括号
         xml_str = self._preprocess(xml_str)
 
         if xml_str.strip().startswith("[") and ("Error" in xml_str or "error" in xml_str):
