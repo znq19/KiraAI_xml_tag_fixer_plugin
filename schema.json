@@ -1,0 +1,20 @@
+{
+  "enabled": {
+    "name": "启用插件",
+    "type": "switch",
+    "default": true,
+    "hint": "是否启用标签修复功能"
+  },
+  "only_final_message": {
+    "name": "仅处理最终消息",
+    "type": "switch",
+    "default": true,
+    "hint": "是否只处理没有 tool_calls 的最终回复（避免干扰中间步骤）"
+  },
+  "fix_missing_msg": {
+    "name": "补全缺失的msg标签",
+    "type": "switch",
+    "default": true,
+    "hint": "如果没有 <msg> 根标签，自动添加"
+  }
+}
