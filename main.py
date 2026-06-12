@@ -11,6 +11,7 @@ class XmlTagFixerPlugin(BasePlugin):
         self.enabled = cfg.get("enabled", True)
         self.only_final = cfg.get("only_final_message", True)
         self.fix_missing_msg = cfg.get("fix_missing_msg", True)
+        self.fix_double_brackets = cfg.get("fix_double_brackets", True)  # 只修复双尖括号
         self.IGNORE_TAGS = {
             "file", "record", "video", "image", "sticker", "forward", "reply", "reasoning",
             "at", "face", "json", "lightapp", "animation", "poke", "node", "location", "share",
@@ -18,10 +19,18 @@ class XmlTagFixerPlugin(BasePlugin):
         }
 
     async def initialize(self):
-        logger.info(f"XmlTagFixerPlugin initialized (only_final={self.only_final}, fix_msg={self.fix_missing_msg})")
+        logger.info(f"XmlTagFixerPlugin initialized (only_final={self.only_final}, fix_msg={self.fix_missing_msg}, "
+                    f"double_brackets={self.fix_double_brackets})")
 
     async def terminate(self):
         logger.info("XmlTagFixerPlugin terminated")
+
+    def _preprocess(self, xml_str: str) -> str:
+        """修复双尖括号错误"""
+        if self.fix_double_brackets:
+            # 修复 <<msg -> <msg, <<function_calls -> <function_calls 等
+            xml_str = re.sub(r'<<(\w+)', r'<\1', xml_str)
+        return xml_str
 
     def _wrap_text_in_element(self, elem: ET.Element) -> bool:
         """递归修复元素内部及尾随的裸文本，跳过忽略标签"""
@@ -29,7 +38,6 @@ class XmlTagFixerPlugin(BasePlugin):
             return False
         modified = False
 
-        # 处理元素本身的 text
         if elem.text and elem.text.strip() and elem.tag != "text":
             text_elem = ET.Element("text")
             text_elem.text = elem.text
@@ -40,19 +48,16 @@ class XmlTagFixerPlugin(BasePlugin):
                 elem.append(text_elem)
             modified = True
 
-        # 递归处理子元素，并处理每个子元素的 tail
         children = list(elem)
         for i, child in enumerate(children):
             if child.tag in self.IGNORE_TAGS:
                 continue
             if self._wrap_text_in_element(child):
                 modified = True
-            # 处理子元素的 tail（结束标签后的文本）
             if child.tail and child.tail.strip():
                 tail_text = ET.Element("text")
                 tail_text.text = child.tail
                 child.tail = None
-                # 将 text 元素插入到 child 之后
                 elem.insert(i + 1, tail_text)
                 modified = True
 
@@ -113,6 +118,9 @@ class XmlTagFixerPlugin(BasePlugin):
                 return [msg_str]
 
     def fix_xml(self, xml_str: str) -> str:
+        # 先预处理双尖括号
+        xml_str = self._preprocess(xml_str)
+
         if xml_str.strip().startswith("[") and ("Error" in xml_str or "error" in xml_str):
             return xml_str
 
@@ -157,4 +165,4 @@ class XmlTagFixerPlugin(BasePlugin):
         fixed = self.fix_xml(original)
         if fixed != original:
             resp.text_response = fixed
-            logger.debug("已修复 XML 结构（处理 tail 文本，拆分混合块）")
+            logger.debug("已修复 XML 结构（双括号、裸露文本、拆分混合块）")
