@@ -4,5 +4,5 @@
   "version": "1.0.2",
   "author": "znq19",
   "description": "自动补全 AI 输出中缺失的 <msg> 和 <text> 标签，防止消息解析失败。",
-  "repo": null
+  "repo": "https://github.com/znq19/KiraAI_xml_tag_fixer_plugin"
 }
