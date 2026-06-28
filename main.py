@@ -29,18 +29,23 @@ class XmlTagFixerPlugin(BasePlugin):
         """修复双尖括号错误"""
         if not self.fix_double_brackets:
             return xml_str
-        # 使用更宽泛的匹配：<<后面跟任意非空字符（但为了安全，只替换标签名）
         new_str = re.sub(r'<<(\w+)', r'<\1', xml_str)
         if new_str != xml_str:
             logger.debug(f"双尖括号修复: {xml_str[:80]} -> {new_str[:80]}")
         return new_str
 
     def _wrap_text_in_element(self, elem: ET.Element) -> bool:
-        """递归修复元素内部及尾随的裸文本，跳过忽略标签"""
+        """
+        递归修复元素内部及尾随的裸文本。
+        对于在 IGNORE_TAGS 中的标签，不处理其内部结构，但会处理其尾随文本。
+        """
         if elem.tag in self.IGNORE_TAGS:
+            # 忽略标签：不处理其内部结构，但尾随文本由父层处理
             return False
+
         modified = False
 
+        # 处理元素的直接文本（非忽略标签）
         if elem.text and elem.text.strip() and elem.tag != "text":
             text_elem = ET.Element("text")
             text_elem.text = elem.text
@@ -51,12 +56,15 @@ class XmlTagFixerPlugin(BasePlugin):
                 elem.append(text_elem)
             modified = True
 
+        # 遍历子元素
         children = list(elem)
         for i, child in enumerate(children):
-            if child.tag in self.IGNORE_TAGS:
-                continue
-            if self._wrap_text_in_element(child):
-                modified = True
+            # 递归处理子元素（如果子元素不是忽略标签）
+            if child.tag not in self.IGNORE_TAGS:
+                if self._wrap_text_in_element(child):
+                    modified = True
+
+            # 处理子元素的尾随文本（无论子元素是否被忽略）
             if child.tail and child.tail.strip():
                 tail_text = ET.Element("text")
                 tail_text.text = child.tail
