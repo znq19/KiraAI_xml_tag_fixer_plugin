@@ -22,5 +22,11 @@
     "type": "switch",
     "default": true,
     "hint": "将 <<msg 修复为 <msg, <<function_calls 修复为 <function_calls 等"
+  },
+  "fix_at_tag_format": {
+    "name": "修复 At 标签格式",
+    "type": "switch",
+    "default": true,
+    "hint": "将 <at user_id=\"123\" /> 修复为 <at>123</at>并如果尾随文本掉标签则修复"
   }
 }
