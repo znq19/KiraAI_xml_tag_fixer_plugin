@@ -1,7 +1,7 @@
 {
   "display_name": "XML 结构修复器（补全msg/text标签）",
   "plugin_id": "xml_tag_fixer",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "author": "znq19",
   "description": "自动补全 AI 输出中缺失的 <msg> 和 <text> 标签，防止消息解析失败。",
   "repo": "https://github.com/znq19/KiraAI_xml_tag_fixer_plugin"
