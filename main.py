@@ -12,8 +12,12 @@ class XmlTagFixerPlugin(BasePlugin):
         self.only_final = cfg.get("only_final_message", True)
         self.fix_missing_msg = cfg.get("fix_missing_msg", True)
         self.fix_double_brackets = cfg.get("fix_double_brackets", True)
-        # ⭐ 新增：修复 at 标签格式
         self.fix_at_tag_format = cfg.get("fix_at_tag_format", True)
+        self.convert_text_at_to_tag = cfg.get("convert_text_at_to_tag", False)
+        # 排除的邮箱域名后缀（额外保护）
+        self.text_at_exclude_domains = cfg.get("text_at_exclude_domains", [
+            "com", "cn", "net", "org", "edu", "gov", "io", "co", "uk", "jp", "de", "fr", "ru"
+        ])
         self.IGNORE_TAGS = {
             "file", "record", "video", "image", "sticker", "forward", "reply", "reasoning",
             "at", "face", "json", "lightapp", "animation", "poke", "node", "location", "share",
@@ -22,13 +26,13 @@ class XmlTagFixerPlugin(BasePlugin):
 
     async def initialize(self):
         logger.info(f"XmlTagFixerPlugin initialized (only_final={self.only_final}, fix_msg={self.fix_missing_msg}, "
-                    f"double_brackets={self.fix_double_brackets}, fix_at={self.fix_at_tag_format})")
+                    f"double_brackets={self.fix_double_brackets}, fix_at={self.fix_at_tag_format}, "
+                    f"convert_at={self.convert_text_at_to_tag})")
 
     async def terminate(self):
         logger.info("XmlTagFixerPlugin terminated")
 
     def _preprocess(self, xml_str: str) -> str:
-        """修复双尖括号错误"""
         if not self.fix_double_brackets:
             return xml_str
         new_str = re.sub(r'<<(\w+)', r'<\1', xml_str)
@@ -37,38 +41,22 @@ class XmlTagFixerPlugin(BasePlugin):
         return new_str
 
     def _fix_at_tags(self, elem: ET.Element) -> None:
-        """
-        修复 at 标签格式：将 <at user_id="123" /> 转换为 <at>123</at>
-        同时处理 <at user_id="123">文本</at> 的情况（如果有文本，保留文本，移除属性）
-        """
         if not self.fix_at_tag_format:
             return
         for child in elem.iter():
             if child.tag == "at":
-                # 情况1: <at user_id="123" /> （自闭合，属性包含 user_id）
                 if child.attrib.get("user_id"):
                     qq = child.attrib.pop("user_id")
                     child.text = qq
-                # 情况2: <at user_id="123">文本</at> （有文本，属性包含 user_id）
                 elif child.attrib.get("user_id") and child.text:
-                    # 已有文本，移除属性即可（保留文本）
                     child.attrib.pop("user_id")
-                # 情况3: <at>123</at> 已经是正确的，不做任何修改
 
     def _wrap_text_in_element(self, elem: ET.Element) -> bool:
-        """
-        递归修复元素内部及尾随的裸文本。
-        如果 fix_at_tag_format 开启，会处理忽略标签的尾随文本。
-        如果关闭，则回退到 v1.0.3 行为（遇到忽略标签直接跳过）。
-        """
         if elem.tag in self.IGNORE_TAGS:
-            # 如果开启了 at 修复，忽略标签仍然需要处理其尾随文本（由父层处理）
-            # 但我们在这里直接返回 False，让父层处理 tail
             return False
 
         modified = False
 
-        # 处理元素的直接文本（非忽略标签）
         if elem.text and elem.text.strip() and elem.tag != "text":
             text_elem = ET.Element("text")
             text_elem.text = elem.text
@@ -79,20 +67,15 @@ class XmlTagFixerPlugin(BasePlugin):
                 elem.append(text_elem)
             modified = True
 
-        # 遍历子元素
         children = list(elem)
         for i, child in enumerate(children):
-            # ⭐ 核心：如果 fix_at_tag_format 关闭，遇到忽略标签直接跳过（v1.0.3 行为）
             if not self.fix_at_tag_format and child.tag in self.IGNORE_TAGS:
                 continue
 
-            # 递归处理子元素（如果子元素不是忽略标签）
             if child.tag not in self.IGNORE_TAGS:
                 if self._wrap_text_in_element(child):
                     modified = True
 
-            # 处理子元素的尾随文本（无论子元素是否被忽略）
-            # ⭐ 当 fix_at_tag_format 开启时，忽略标签的 tail 也会被处理
             if child.tail and child.tail.strip():
                 tail_text = ET.Element("text")
                 tail_text.text = child.tail
@@ -102,9 +85,68 @@ class XmlTagFixerPlugin(BasePlugin):
 
         return modified
 
+    def _convert_text_at_in_element(self, elem: ET.Element, parent: ET.Element = None) -> None:
+        """
+        递归处理元素及其子元素，将 text 节点中的 @纯数字 替换为 at 标签。
+        规则：
+        - @ 前后不能是字母、数字、下划线、点号
+        - 数字至少 4 位（避免误转换短数字）
+        - 排除邮箱地址（@数字.后缀）通过负向先行断言实现
+        """
+        if not self.convert_text_at_to_tag:
+            return
+
+        # 先处理子节点（深度优先）
+        for child in list(elem):
+            self._convert_text_at_in_element(child, elem)
+
+        if elem.tag == "text" and elem.text:
+            txt = elem.text
+
+            # 构建排除域名后缀的正则
+            domains_pattern = '|'.join(re.escape(d) for d in self.text_at_exclude_domains)
+            # 核心正则：
+            # - 前后边界：前面不能是字母数字下划线点号，后面不能是字母数字下划线点号
+            # - 数字至少 4 位
+            # - 负向先行断言排除邮箱：@数字 后面不能直接跟 .后缀 (且后缀后跟单词边界或结束)
+            pattern = rf'(?<![A-Za-z0-9_.])@(\d{{4,}})(?![A-Za-z0-9_.])(?!\.(?:{domains_pattern})(?:\b|$))'
+
+            if not re.search(pattern, txt):
+                return
+
+            # 使用保留分隔符的方式分割
+            parts = re.split(rf'(@\d{{4,}})', txt)
+
+            new_nodes = []
+            for part in parts:
+                if not part:
+                    continue
+                m = re.match(r'@(\d{4,})', part)
+                if m:
+                    # 再次验证是否符合完整规则
+                    if re.search(pattern, part):
+                        at_elem = ET.Element("at")
+                        at_elem.text = m.group(1)
+                        new_nodes.append(at_elem)
+                    else:
+                        new_text = ET.Element("text")
+                        new_text.text = part
+                        new_nodes.append(new_text)
+                else:
+                    new_text = ET.Element("text")
+                    new_text.text = part
+                    new_nodes.append(new_text)
+
+            if len(new_nodes) == 1 and new_nodes[0].tag == "text":
+                return
+
+            if parent is not None:
+                idx = list(parent).index(elem)
+                parent.remove(elem)
+                for node in reversed(new_nodes):
+                    parent.insert(idx, node)
+
     def _fix_single_msg(self, msg_str: str) -> list[str]:
-        """返回修复后的消息列表（可能拆分多个）"""
-        # 先修复双尖括号（兜底）
         if self.fix_double_brackets:
             msg_str = re.sub(r'<<(\w+)', r'<\1', msg_str)
 
@@ -151,10 +193,9 @@ class XmlTagFixerPlugin(BasePlugin):
             try:
                 root = ET.fromstring(msg_str)
                 if root.tag == "msg":
-                    # ⭐ 先修复 at 标签格式（如果开启）
                     self._fix_at_tags(root)
-                    # ⭐ 再包裹裸文本
                     self._wrap_text_in_element(root)
+                    self._convert_text_at_in_element(root, None)
                     fixed = ET.tostring(root, encoding="unicode", method="xml")
                     return [fixed]
                 else:
@@ -164,7 +205,6 @@ class XmlTagFixerPlugin(BasePlugin):
                 return [msg_str]
 
     def fix_xml(self, xml_str: str) -> str:
-        # 预处理全局双尖括号
         xml_str = self._preprocess(xml_str)
 
         if xml_str.strip().startswith("[") and ("Error" in xml_str or "error" in xml_str):
