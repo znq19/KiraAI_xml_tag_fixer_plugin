@@ -27,6 +27,17 @@
     "name": "修复 At 标签格式",
     "type": "switch",
     "default": true,
-    "hint": "将 <at user_id=\"123\" /> 修复为 <at>123</at>并如果尾随文本掉标签则修复"
+    "hint": "将 <at user_id=\"123\" /> 修复为 <at>123</at>，并处理尾随文本"
+  },
+  "convert_text_at_to_tag": {
+    "name": "将文本 @数字 转换为 at 标签",
+    "type": "switch",
+    "default": false,
+    "hint": "开启后，会将 text 节点中的 @纯数字（至少4位）替换为 <at>数字</at>。注意：虽已排除了常见出错情况，但此项仍处于实验性阶段，建议AI经常出现@数字的非有效方式时才启用"
+  },
+  "text_at_exclude_domains": {
+    "type": "list",
+    "default": ["com", "cn", "net", "org", "edu", "gov", "io", "co", "uk", "jp", "de", "fr", "ru"],
+    "hint": "排除的邮箱域名后缀列表，当 @数字 后面紧跟 .后缀 时不触发 at 转换。可自行添加或删除"
   }
 }
