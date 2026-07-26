@@ -24,6 +24,7 @@ class XmlTagFixerPlugin(BasePlugin):
         self.convert_text_at_to_tag = cfg.get("convert_text_at_to_tag", False)
         self.escape_special_chars = cfg.get("escape_special_chars", True)
         self.fallback_wrap_text = cfg.get("fallback_wrap_text", True)
+        self.fallback_strip_tags = cfg.get("fallback_strip_tags", True)
         self.flatten_no_wrap_tags = cfg.get("flatten_no_wrap_tags", True)
         self.fix_record_split = cfg.get("fix_record_split", True)
         self.split_blank_line_messages = cfg.get("split_blank_line_messages", False)
@@ -246,6 +247,8 @@ class XmlTagFixerPlugin(BasePlugin):
     # ========== 空行分段拆消息 ==========
 
     _BLANK_LINE_RE = re.compile(r"\n[ \t]*\n+")
+    # [xxx] 或 [/xxx] 式文本标记（其他插件可能用其做自定义协议，如折扇留穗 [3p]）
+    _BBCODE_MARKER_RE = re.compile(r"\[/?[a-zA-Z0-9_]+\]")
 
     def _split_blank_lines(self, root: ET.Element) -> Optional[list]:
         """空行分段拆消息（默认关闭）。
@@ -263,6 +266,10 @@ class XmlTagFixerPlugin(BasePlugin):
         for c in children:
             txt = c.text or ""
             if "```" in txt:
+                return None
+            if self._BBCODE_MARKER_RE.search(txt):
+                # 含 [xxx] 式文本标记（如折扇留穗的 [3p]...[/3p]），整条不拆，
+                # 避免标记对被打散到其他消息导致其他插件无法识别
                 return None
             for p in self._BLANK_LINE_RE.split(txt):
                 p = p.strip()
@@ -283,23 +290,41 @@ class XmlTagFixerPlugin(BasePlugin):
 
     # ========== 终极兜底 ==========
 
-    def _fallback_wrap(self, original_block: str) -> list:
-        """所有修复手段都失败时，把整段内容转义为纯文本消息。
+    def _strip_structural_tags(self, s: str) -> str:
+        """剥离已知结构性标签（框架标签 + 不包裹名单），只保留文本内容。
 
+        仅用于兜底清洗；用户有意写的未知字面标签（如 <div>）不受影响。
+        """
+        tags = self.IGNORE_TAGS | {"msg", "text"} | self.no_wrap_tags
+        pattern = r"</?(?:" + "|".join(sorted(tags, key=len, reverse=True)) + r")(?:\s[^>]*)?/?>"
+        return re.sub(pattern, "", s, flags=re.IGNORECASE)
+
+    def _fallback_wrap(self, original_block: str) -> list:
+        """所有修复手段都失败时，清洗为纯文本消息。
+
+        两种模式（fallback_strip_tags 控制）：
+        - 开（默认）：反转义后剥离结构性标签、只留干净文本，
+          用户不会看到 <msg>/<text> 原文；适合日常聊天。
+        - 关：整段转义保留所有内容（包括标签原文），
+          适合 payload/注入测试等要求逐字保真的场景。
         保证消息能发出去，且进入记忆的永远是良构 XML。
         注意基于未转义的原始块处理，避免双重转义。
         """
         if not self.fallback_wrap_text:
             return [original_block]
         inner = original_block.strip()
-        # 去掉外层 msg 标签，避免把 <msg> 当文本显示出来
-        inner = re.sub(r"^<msg[^>]*>", "", inner)
-        inner = re.sub(r"</msg>\s*$", "", inner)
-        if not inner.strip():
-            return [original_block]
-        # 先反转义已有实体再统一转义，避免 &amp; 被二次转义
+        # 先反转义已有实体，后续两种模式都基于还原后的文本处理
         inner = xml_unescape(inner, {"&quot;": '"', "&apos;": "'"})
-        logger.debug(f"触发终极兜底，整段转为纯文本消息: {original_block[:80]}")
+        if self.fallback_strip_tags:
+            # 剥离结构性标签，只留文本（媒体标签的内容会丢失，但兜底场景下好过显示一坨 XML）
+            inner = self._strip_structural_tags(inner).strip()
+        else:
+            # 保真模式：只去掉最外层 msg 包裹，其余原样保留
+            inner = re.sub(r"^<msg[^>]*>", "", inner)
+            inner = re.sub(r"</msg>\s*$", "", inner).strip()
+        if not inner:
+            return [original_block]
+        logger.debug(f"触发终极兜底，清洗为纯文本消息: {original_block[:80]}")
         return [f"<msg><text>{xml_escape(inner)}</text></msg>"]
 
     def _fix_single_msg(self, msg_str: str) -> list:
@@ -383,10 +408,23 @@ class XmlTagFixerPlugin(BasePlugin):
                 if remainder:
                     msg_blocks.append(remainder)
                 break
-            end_idx = xml_str.find("</msg>", idx)
-            if end_idx == -1:
+            open_end = xml_str.find(">", idx)
+            if open_end == -1:
                 msg_blocks.append(xml_str[idx:])
                 break
+            if xml_str[open_end - 1] == "/":
+                # 自闭合 <msg/> 或 <msg .../>：独立成块，避免吞掉后续消息
+                msg_blocks.append(xml_str[idx:open_end + 1])
+                start_pos = open_end + 1
+                continue
+            end_idx = xml_str.find("</msg>", open_end + 1)
+            next_open = xml_str.find("<msg", open_end + 1)
+            if end_idx == -1 or (next_open != -1 and next_open < end_idx):
+                # 未正常闭合（没有 </msg> 或闭合前出现新 <msg）：截断为独立块，走修复/兜底
+                cut = next_open if next_open != -1 else len(xml_str)
+                msg_blocks.append(xml_str[idx:cut])
+                start_pos = cut
+                continue
             msg_blocks.append(xml_str[idx:end_idx + 6])
             start_pos = end_idx + 6
 
@@ -397,7 +435,7 @@ class XmlTagFixerPlugin(BasePlugin):
                 continue
             result_list = self._fix_single_msg(block)
             for fixed in result_list:
-                if fixed == "<msg/>" or fixed == "<msg></msg>":
+                if re.fullmatch(r"<msg\s*/>|<msg>\s*</msg>", fixed.strip()):
                     logger.debug("丢弃完全空的消息块")
                     continue
                 fixed_blocks.append(fixed)
