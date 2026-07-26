@@ -366,6 +366,17 @@ class XmlTagFixerPlugin(BasePlugin):
         pattern = r"</?(?:" + "|".join(sorted(tags, key=len, reverse=True)) + r")(?:\s[^>]*)?/?>"
         return re.sub(pattern, "", s, flags=re.IGNORECASE)
 
+    def _strip_outside_fences(self, s: str) -> str:
+        """只剥离代码围栏 ``` 之外的结构标签，围栏内的代码逐字保留。
+
+        按 ``` 分段，偶数段在围栏外、奇数段是代码；
+        围栏未闭合时剩余内容保守地全部当代码保留。
+        """
+        parts = s.split("```")
+        for i in range(0, len(parts), 2):
+            parts[i] = self._strip_structural_tags(parts[i])
+        return "```".join(parts)
+
     def _fallback_wrap(self, original_block: str) -> list:
         """所有修复手段都失败时，清洗为纯文本消息。
 
@@ -383,8 +394,11 @@ class XmlTagFixerPlugin(BasePlugin):
         # 先反转义已有实体，后续两种模式都基于还原后的文本处理
         inner = xml_unescape(inner, {"&quot;": '"', "&apos;": "'"})
         if self.fallback_strip_tags:
-            # 剥离结构性标签，只留文本（媒体标签的内容会丢失，但兜底场景下好过显示一坨 XML）
-            inner = self._strip_structural_tags(inner).strip()
+            # 剥离结构性标签，只留文本；代码围栏内的内容逐字保留，不吃代码里的标签
+            if "```" in inner:
+                inner = self._strip_outside_fences(inner).strip()
+            else:
+                inner = self._strip_structural_tags(inner).strip()
         else:
             # 保真模式：只去掉最外层 msg 包裹，其余原样保留
             inner = re.sub(r"^<msg[^>]*>", "", inner)
