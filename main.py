@@ -28,6 +28,7 @@ class XmlTagFixerPlugin(BasePlugin):
         self.flatten_no_wrap_tags = cfg.get("flatten_no_wrap_tags", True)
         self.fix_record_split = cfg.get("fix_record_split", True)
         self.split_blank_line_messages = cfg.get("split_blank_line_messages", False)
+        self.merge_marker_span_msgs = cfg.get("merge_marker_span_msgs", True)
         # 排除的邮箱域名后缀（额外保护）
         self.text_at_exclude_domains = cfg.get("text_at_exclude_domains", [
             "com", "cn", "net", "org", "edu", "gov", "io", "co", "uk", "jp", "de", "fr", "ru"
@@ -288,6 +289,72 @@ class XmlTagFixerPlugin(BasePlugin):
         logger.debug(f"空行分段：单条消息拆为 {len(paragraphs)} 条发送")
         return results
 
+    # ========== 跨消息标记对合并 ==========
+
+    def _try_merge_text_blocks(self, blocks: list) -> Optional[str]:
+        """尝试把多个 msg 块合并为一条纯文本 msg；任一块含非 text 子元素或无法解析则放弃。"""
+        texts = []
+        for b in blocks:
+            try:
+                root = ET.fromstring(b)
+            except ET.ParseError:
+                return None
+            if root.tag != "msg":
+                return None
+            children = list(root)
+            if not children or any(c.tag != "text" for c in children):
+                return None
+            part = "".join(c.text or "" for c in children).strip()
+            texts.append(part)
+        msg = ET.Element("msg")
+        te = ET.SubElement(msg, "text")
+        te.text = "\n\n".join(t for t in texts if t)
+        return ET.tostring(msg, encoding="unicode", method="xml")
+
+    def _merge_marker_spanning_blocks(self, blocks: list) -> list:
+        """合并被 [xxx]...[/xxx] 标记对横跨的连续纯文本消息。
+
+        模型有时会把 [3p] 写在一条消息、[/3p] 写在另一条，
+        而折扇留穗等插件只在单条消息内匹配标记对，导致无法触发。
+        这里在输出前把横跨的消息合并为一条（仅限纯文本消息），
+        让标记对落在同一消息中。
+        """
+        if not self.merge_marker_span_msgs or len(blocks) < 2:
+            return blocks
+        result = []
+        i = 0
+        n = len(blocks)
+        while i < n:
+            block = blocks[i]
+            opener = None
+            for m in re.finditer(r"\[([a-zA-Z0-9_]+)\]", block):
+                tag = m.group(1)
+                if f"[/{tag}]" not in block:
+                    opener = tag
+                    break
+            if opener is None:
+                result.append(block)
+                i += 1
+                continue
+            closer_idx = None
+            for j in range(i + 1, n):
+                if f"[/{opener}]" in blocks[j]:
+                    closer_idx = j
+                    break
+            if closer_idx is None:
+                result.append(block)
+                i += 1
+                continue
+            merged = self._try_merge_text_blocks(blocks[i:closer_idx + 1])
+            if merged is None:
+                result.append(block)
+                i += 1
+                continue
+            logger.debug(f"检测到 [{opener}] 标记对横跨 {closer_idx - i + 1} 条消息，已合并为一条")
+            result.append(merged)
+            i = closer_idx + 1
+        return result
+
     # ========== 终极兜底 ==========
 
     def _strip_structural_tags(self, s: str) -> str:
@@ -439,6 +506,7 @@ class XmlTagFixerPlugin(BasePlugin):
                     logger.debug("丢弃完全空的消息块")
                     continue
                 fixed_blocks.append(fixed)
+        fixed_blocks = self._merge_marker_spanning_blocks(fixed_blocks)
         return "\n".join(fixed_blocks)
 
     @on.llm_response(priority=Priority.HIGH)
