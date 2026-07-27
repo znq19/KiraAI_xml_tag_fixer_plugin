@@ -1,4 +1,4 @@
-# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.1.2
+# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.1.3
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_xml_tag_fixer_plugin)
 
@@ -69,6 +69,10 @@
 
 <details>
 <summary><b>更新日志（点击展开）</b></summary>
+
+### 1.1.3 修复
+
+- **空消息 `<msg/>` 不再丢弃**：`<msg/>` 是 AI 合法的「静默」操作，框架会自行优雅处理。旧版丢弃空块会让 `resp.text_response` 变成空字符串，导致：①下游插件按 `<msg/>` 正则检测静默时失效；②记忆里写入的是空字符串而不是 `<msg/>`，AI 无法从历史中区分「说了话」和「选择了闭嘴」，也学不到静默是良性操作。现在原样透传
 
 ### 1.1.2 修复
 

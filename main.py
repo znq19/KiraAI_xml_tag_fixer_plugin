@@ -515,11 +515,9 @@ class XmlTagFixerPlugin(BasePlugin):
             if not block:
                 continue
             result_list = self._fix_single_msg(block)
-            for fixed in result_list:
-                if re.fullmatch(r"<msg\s*/>|<msg>\s*</msg>", fixed.strip()):
-                    logger.debug("丢弃完全空的消息块")
-                    continue
-                fixed_blocks.append(fixed)
+            # 空消息 <msg/> 是合法的「静默」操作，原样透传：
+            # 框架会自行优雅处理，下游插件和记忆持久化都依赖这个标记
+            fixed_blocks.extend(result_list)
         fixed_blocks = self._merge_marker_spanning_blocks(fixed_blocks)
         return "\n".join(fixed_blocks)
 
