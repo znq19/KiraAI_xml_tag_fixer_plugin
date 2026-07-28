@@ -29,6 +29,7 @@ class XmlTagFixerPlugin(BasePlugin):
         self.fix_record_split = cfg.get("fix_record_split", True)
         self.split_blank_line_messages = cfg.get("split_blank_line_messages", False)
         self.merge_marker_span_msgs = cfg.get("merge_marker_span_msgs", True)
+        self.strip_reasoning_block = cfg.get("strip_reasoning_block", True)
         # 排除的邮箱域名后缀（额外保护）
         self.text_at_exclude_domains = cfg.get("text_at_exclude_domains", [
             "com", "cn", "net", "org", "edu", "gov", "io", "co", "uk", "jp", "de", "fr", "ru"
@@ -105,6 +106,31 @@ class XmlTagFixerPlugin(BasePlugin):
                 inst.auto_format_fix = False
                 logger.info("已接管 MiMo TTS 的格式修复（标签摊平 + 语音拆分由本插件处理），"
                             "mimo 插件的 auto_format_fix 已运行时关闭")
+
+    # ========== 内联 reasoning 块剥离 ==========
+
+    # 闭合的 <reasoning>...</reasoning> 整段
+    _REASONING_BLOCK_RE = re.compile(r"<reasoning>.*?</reasoning>", re.DOTALL | re.IGNORECASE)
+    # 未闭合的 <reasoning> 到末尾（按 XML 语义，未闭合则后续全属思考内容）
+    _REASONING_TAIL_RE = re.compile(r"<reasoning>.*$", re.DOTALL | re.IGNORECASE)
+
+    def _strip_reasoning(self, xml_str: str) -> str:
+        """剥离内联在正文中的 <reasoning> 思考块。
+
+        部分渠道/模型会把思考过程以 <reasoning> 标签形式写进 text_response
+        （而不是 reasoning_content 字段），其中常含 <msg> 草稿、示例消息，
+        不剥掉会被切块器当成真消息边界，导致思考内容、示例、重复消息泄漏给用户。
+        框架原生对未知标签是静默跳过的，这里与之对齐。
+        """
+        if not self.strip_reasoning_block:
+            return xml_str
+        if "<reasoning" not in xml_str.lower():
+            return xml_str
+        new = self._REASONING_BLOCK_RE.sub("", xml_str)
+        new = self._REASONING_TAIL_RE.sub("", new)
+        if new != xml_str:
+            logger.debug("已剥离内联 reasoning 思考块")
+        return new
 
     # ========== 裸特殊字符转义 ==========
 
@@ -474,6 +500,7 @@ class XmlTagFixerPlugin(BasePlugin):
                 return self._fallback_wrap(original)
 
     def fix_xml(self, xml_str: str) -> str:
+        xml_str = self._strip_reasoning(xml_str)
         if self.fix_double_brackets:
             xml_str = re.sub(r'<<(\w+)', r'<\1', xml_str)
 
