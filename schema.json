@@ -70,6 +70,12 @@
     "default": false,
     "hint": "开启后，单条消息内的空行分段会拆成多条消息发送（模拟真人分段说话）。含代码围栏或 [xxx] 式文本标记（如折扇留穗的 [3p]）的消息整条不拆；仅对纯文本消息生效。可能改变说话风格，根据情况自行开启"
   },
+  "strip_reasoning_block": {
+    "name": "剥离内联 reasoning 思考块",
+    "type": "switch",
+    "default": true,
+    "hint": "部分渠道/模型会把思考过程以 <reasoning> 标签写进正文（而不是 reasoning_content 字段），其中常含消息草稿和示例，不剥离会泄漏给用户。建议保持开启"
+  },
   "merge_marker_span_msgs": {
     "name": "合并跨消息的 [xxx] 标记对",
     "type": "switch",

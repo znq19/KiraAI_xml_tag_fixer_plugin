@@ -1,4 +1,4 @@
-# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.1.3
+# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.1.4
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_xml_tag_fixer_plugin)
 
@@ -69,6 +69,10 @@
 
 <details>
 <summary><b>更新日志（点击展开）</b></summary>
+
+### 1.1.4 修复
+
+- **内联 `<reasoning>` 思考块泄漏**：部分渠道/模型会把思考过程以 `<reasoning>` 标签写进正文（而不是 reasoning_content 字段），其中常含 `<msg>` 草稿、示例消息。旧版切块器会把思考里的 `<msg>` 字样当成真消息边界，导致思考内容被兜底发出、示例消息当真题发送、正式消息重复发送。现在处理前会先剥离内联 reasoning 块（未闭合的剥到末尾，与框架"未知标签跳过"语义对齐），可通过「剥离内联 reasoning 思考块」配置关闭
 
 ### 1.1.3 修复
 
