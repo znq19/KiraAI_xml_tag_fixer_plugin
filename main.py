@@ -18,6 +18,11 @@ class XmlTagFixerPlugin(BasePlugin):
         super().__init__(ctx, cfg)
         self.enabled = cfg.get("enabled", True)
         self.only_final = cfg.get("only_final_message", False)
+        # text 包裹模式：blacklist（默认，只包落单文字+黑名单标签）/ whitelist（旧行为，除豁免外全包）
+        self.wrap_mode = cfg.get("wrap_mode", "blacklist")
+        if self.wrap_mode not in ("blacklist", "whitelist"):
+            logger.warning(f"无法识别的 wrap_mode: {self.wrap_mode!r}，回退为 blacklist")
+            self.wrap_mode = "blacklist"
         self.fix_missing_msg = cfg.get("fix_missing_msg", True)
         self.fix_double_brackets = cfg.get("fix_double_brackets", True)
         self.fix_at_tag_format = cfg.get("fix_at_tag_format", True)
@@ -50,6 +55,18 @@ class XmlTagFixerPlugin(BasePlugin):
             elif item and str(item).strip():
                 logger.debug(f"忽略无法识别的 no_wrap_tags 配置项: {item!r}")
 
+        # 强制包裹黑名单（仅 blacklist 模式生效）：名单内标签里的文字强制包进 <text>
+        # 优先级 IGNORE_TAGS > no_wrap_tags > force_wrap_tags：重复时赦免优先
+        self.force_wrap_tags = set()
+        for item in (cfg.get("force_wrap_tags") or []):
+            name = self._normalize_tag_name(item)
+            if name:
+                self.force_wrap_tags.add(name)
+            elif item and str(item).strip():
+                logger.debug(f"忽略无法识别的 force_wrap_tags 配置项: {item!r}")
+        self.force_wrap_tags -= self.IGNORE_TAGS
+        self.force_wrap_tags -= self.no_wrap_tags
+
         self._mimo_checked = False
 
     @staticmethod
@@ -68,7 +85,8 @@ class XmlTagFixerPlugin(BasePlugin):
         return m.group(0) if m else ""
 
     async def initialize(self):
-        logger.info(f"XmlTagFixerPlugin initialized (only_final={self.only_final}, fix_msg={self.fix_missing_msg}, "
+        logger.info(f"XmlTagFixerPlugin initialized (mode={self.wrap_mode}, force_wrap={sorted(self.force_wrap_tags)}, "
+                    f"only_final={self.only_final}, fix_msg={self.fix_missing_msg}, "
                     f"double_brackets={self.fix_double_brackets}, fix_at={self.fix_at_tag_format}, "
                     f"convert_at={self.convert_text_at_to_tag}, escape={self.escape_special_chars}, "
                     f"fallback={self.fallback_wrap_text}, no_wrap={sorted(self.no_wrap_tags)}, "
@@ -176,13 +194,20 @@ class XmlTagFixerPlugin(BasePlugin):
             else:
                 self._flatten_no_wrap(child)
 
-    def _wrap_text_in_element(self, elem: ET.Element) -> bool:
+    def _wrap_text_in_element(self, elem: ET.Element, wrap_here: bool = True) -> bool:
+        """把松散文字包进 <text>。
+
+        wrap_here: 当前元素是否是包裹上下文（是则处理其直接文本与子元素的 tail）。
+        - whitelist（旧行为）：所有非 IGNORE/豁免标签都是包裹上下文，递归全包；
+        - blacklist（默认）：仅 msg 根与 force_wrap_tags 内标签是包裹上下文，
+          其余标签的内容保持原样、信任模型/插件的输出。
+        """
         if elem.tag in self.IGNORE_TAGS or elem.tag in self.no_wrap_tags:
             return False
 
         modified = False
 
-        if elem.text and elem.text.strip() and elem.tag != "text":
+        if wrap_here and elem.text and elem.text.strip() and elem.tag != "text":
             text_elem = ET.Element("text")
             text_elem.text = elem.text
             elem.text = None
@@ -198,10 +223,14 @@ class XmlTagFixerPlugin(BasePlugin):
                 continue
 
             if child.tag not in self.IGNORE_TAGS and child.tag not in self.no_wrap_tags:
-                if self._wrap_text_in_element(child):
+                if self.wrap_mode == "whitelist":
+                    child_wrap = True
+                else:
+                    child_wrap = child.tag in self.force_wrap_tags
+                if self._wrap_text_in_element(child, child_wrap):
                     modified = True
 
-            if child.tail and child.tail.strip():
+            if wrap_here and child.tail and child.tail.strip():
                 tail_text = ET.Element("text")
                 tail_text.text = child.tail
                 child.tail = None

@@ -47,16 +47,29 @@
     "default": true,
     "hint": "将 <at user_id=\"123\" /> 修复为 <at>123</at>，并处理尾随文本"
   },
+  "wrap_mode": {
+    "name": "text 包裹模式",
+    "type": "enum",
+    "options": ["blacklist", "whitelist"],
+    "default": "blacklist",
+    "hint": "blacklist（默认）：已包裹在其他标签里的内容保持原样，只有 msg 下落单的文字和「强制包裹黑名单」内标签的文字会被包进 <text>，不会再误伤其他插件的自定义标签；whitelist：旧版行为，除内置标签和下方不包裹名单外的所有标签内容都会被包进 <text>，自定义标签多的环境容易出现内容静默丢失"
+  },
+  "force_wrap_tags": {
+    "name": "强制包裹黑名单",
+    "type": "list",
+    "default": [],
+    "hint": "仅黑名单模式生效：名单内标签里的文字会被强制包进 <text>，填纯标签名即可（带不带尖括号都能识别）。与下方不包裹名单重复时，不包裹优先"
+  },
   "no_wrap_tags": {
     "type": "list",
     "default": ["mimo_tts"],
-    "hint": "不包裹 <text> 的自定义标签名单，填纯标签名即可（如 mimo_tts），带不带尖括号都能识别。mimo_tts 始终内置保护，可自行追加其他插件的标签"
+    "hint": "不包裹 <text> 的自定义标签名单，填纯标签名即可（如 mimo_tts），带不带尖括号都能识别。mimo_tts 始终内置保护，可自行追加其他插件的标签。黑名单模式下默认就不包裹任何标签，此名单主要作为下方「摊平嵌套」和白名单模式的赦免名单"
   },
   "flatten_no_wrap_tags": {
     "name": "摊平不包裹标签内的嵌套",
     "type": "switch",
     "default": true,
-    "hint": "剥掉上面名单内标签被模型错误嵌套的 <text> 等子标签（如 <mimo_tts><text>内容</text></mimo_tts> → <mimo_tts>内容</mimo_tts>），防止内容在解析阶段静默丢失"
+    "hint": "剥掉上面不包裹名单内标签被模型错误嵌套的 <text> 等子标签（如 <mimo_tts><text>内容</text></mimo_tts> → <mimo_tts>内容</mimo_tts>），防止内容在解析阶段静默丢失"
   },
   "fix_record_split": {
     "name": "语音消息拆分发送",
