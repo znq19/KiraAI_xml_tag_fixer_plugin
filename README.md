@@ -1,4 +1,4 @@
-# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.1.4
+# KiraAI_xml_tag_fixer_plugin/掉消息标签修复插件1.2.0
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_xml_tag_fixer_plugin)
 
