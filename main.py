@@ -28,13 +28,23 @@ class XmlTagFixerPlugin(BasePlugin):
         self.fix_at_tag_format = cfg.get("fix_at_tag_format", True)
         self.convert_text_at_to_tag = cfg.get("convert_text_at_to_tag", False)
         self.escape_special_chars = cfg.get("escape_special_chars", True)
+        self.escape_code_fences = cfg.get("escape_code_fences", True)
         self.fallback_wrap_text = cfg.get("fallback_wrap_text", True)
         self.fallback_strip_tags = cfg.get("fallback_strip_tags", True)
         self.flatten_no_wrap_tags = cfg.get("flatten_no_wrap_tags", True)
         self.fix_record_split = cfg.get("fix_record_split", True)
         self.split_blank_line_messages = cfg.get("split_blank_line_messages", False)
         self.merge_marker_span_msgs = cfg.get("merge_marker_span_msgs", True)
-        self.strip_reasoning_block = cfg.get("strip_reasoning_block", True)
+        # 「处理 msg 外杂散内容」总开关（键名保留 strip_reasoning_block 兼容旧配置）
+        self.handle_stray_content = cfg.get("strip_reasoning_block", True)
+        # @on.llm_request 缓存的已注册标签名（区分 msg 级 / root 级），
+        # 用于杂散内容按身份分流：已注册标签内容绝不转义，未注册标签内部整体转义。
+        # 初始值填入框架内置标签：即使缓存尚未刷新（异常/首次），内置功能标签也受保护
+        self._registered_msg_tags: set = {
+            "text", "image", "at", "reply", "forward", "emoji",
+            "record", "file", "video", "poke", "json",
+        }
+        self._registered_root_tags: set = set()
         # 排除的邮箱域名后缀（额外保护）
         self.text_at_exclude_domains = cfg.get("text_at_exclude_domains", [
             "com", "cn", "net", "org", "edu", "gov", "io", "co", "uk", "jp", "de", "fr", "ru"
@@ -91,7 +101,7 @@ class XmlTagFixerPlugin(BasePlugin):
                     f"convert_at={self.convert_text_at_to_tag}, escape={self.escape_special_chars}, "
                     f"fallback={self.fallback_wrap_text}, no_wrap={sorted(self.no_wrap_tags)}, "
                     f"flatten={self.flatten_no_wrap_tags}, record_split={self.fix_record_split}, "
-                    f"split_blank={self.split_blank_line_messages})")
+                    f"split_blank={self.split_blank_line_messages}, stray={self.handle_stray_content})")
         self._try_takeover_mimo()
 
     async def terminate(self):
@@ -125,30 +135,119 @@ class XmlTagFixerPlugin(BasePlugin):
                 logger.info("已接管 MiMo TTS 的格式修复（标签摊平 + 语音拆分由本插件处理），"
                             "mimo 插件的 auto_format_fix 已运行时关闭")
 
-    # ========== 内联 reasoning 块剥离 ==========
+    # ========== 代码围栏感知转义 ==========
 
-    # 闭合的 <reasoning>...</reasoning> 整段
-    _REASONING_BLOCK_RE = re.compile(r"<reasoning>.*?</reasoning>", re.DOTALL | re.IGNORECASE)
-    # 未闭合的 <reasoning> 到末尾（按 XML 语义，未闭合则后续全属思考内容）
-    _REASONING_TAIL_RE = re.compile(r"<reasoning>.*$", re.DOTALL | re.IGNORECASE)
+    def _escape_code_fences(self, xml_str: str) -> str:
+        """代码围栏 ``` 内的内容整体转义为纯文本。
 
-    def _strip_reasoning(self, xml_str: str) -> str:
-        """剥离内联在正文中的 <reasoning> 思考块。
-
-        部分渠道/模型会把思考过程以 <reasoning> 标签形式写进 text_response
-        （而不是 reasoning_content 字段），其中常含 <msg> 草稿、示例消息，
-        不剥掉会被切块器当成真消息边界，导致思考内容、示例、重复消息泄漏给用户。
-        框架原生对未知标签是静默跳过的，这里与之对齐。
+        围栏内的 <foo>、<msg> 等只是代码文本，不应被当作标签：不转义会被
+        ET 解析成元素、遭框架静默跳过（用户看到的代码缺行），<msg> 字样还会
+        误导切块器把围栏切开。围栏内 & 一律转义（包括已有实体 &amp;），
+        保证代码经 ET 往返逐字保真。围栏未闭合时剩余内容全部当代码，
+        与兜底逻辑 _strip_outside_fences 的约定一致。
         """
-        if not self.strip_reasoning_block:
+        if not self.escape_code_fences or "```" not in xml_str:
             return xml_str
-        if "<reasoning" not in xml_str.lower():
-            return xml_str
-        new = self._REASONING_BLOCK_RE.sub("", xml_str)
-        new = self._REASONING_TAIL_RE.sub("", new)
-        if new != xml_str:
-            logger.debug("已剥离内联 reasoning 思考块")
-        return new
+        parts = xml_str.split("```")
+        for i in range(1, len(parts), 2):
+            parts[i] = xml_escape(parts[i])
+        return "```".join(parts)
+
+    # ========== msg 外杂散内容：统一保护 / 分流 ==========
+
+    # 成对的非 msg 标签块 <foo ...>...</foo>
+    _STRAY_PAIR_RE = re.compile(r"<([a-zA-Z][\w-]*)((?:\s[^>]*)?)>(.*?)</\1>", re.DOTALL)
+    # 散段是「单个标签块」（成对或自闭合）的识别
+    _STRAY_SINGLE_BLOCK_RE = re.compile(
+        r"^<([a-zA-Z][\w-]*)(?:\s[^>]*)?>.*?</\1>$|^<([a-zA-Z][\w-]*)(?:\s[^>]*)?/>$", re.DOTALL)
+    # 标签开口（判断未闭合尾巴用；属性懒惰匹配，避免吞掉自闭合的 /）
+    _TAG_OPEN_RE = re.compile(r"<([a-zA-Z][\w-]*)(?:\s[^>]*?)?(/?)>")
+
+    @on.llm_request()
+    async def cache_registered_tags(self, event, req, tag_set, *_):
+        """缓存本次请求 tag_set 的已注册标签名，供杂散内容按身份分流。
+
+        已注册标签（内置 text/record/file 及插件注册的 mimo_tts 等）内容绝不转义；
+        未注册标签（reasoning/think/foo 等）内部整体转义后原样保留。
+        """
+        try:
+            self._registered_msg_tags = {t.name for t in tag_set.get_all()}
+            self._registered_root_tags = {t.name for t in tag_set.get_all_root()}
+        except Exception:
+            pass
+
+    @staticmethod
+    def _inside_msg(prefix: str) -> bool:
+        """粗判某位置是否处于未闭合的 <msg> 内部（msg 不会合法嵌套，计数即可）。"""
+        opens = len(re.findall(r"<msg(?:\s[^>]*)?>", prefix))
+        self_closing = len(re.findall(r"<msg(?:\s[^>]*)?/>", prefix))
+        return opens - self_closing - prefix.count("</msg>") > 0
+
+    def _handle_unclosed_tail(self, xml_str: str) -> str:
+        """处理 root 级未闭合的非 msg 标签尾巴。
+
+        已注册/no_wrap 标签：补上闭合标签救回内容（如模型没写完的 mimo_tts）；
+        未注册标签（reasoning 等）：剥到末尾——其后可能混着真消息，无法安全切分，
+        且框架原生遇到未闭合会整段解析失败，剥离是损失更小的选择；
+        msg 内部的未闭合标签不动（留给解析失败 → 兜底管线）。
+        """
+        for m in self._TAG_OPEN_RE.finditer(xml_str):
+            tag = m.group(1)
+            if tag == "msg" or m.group(2) == "/":
+                continue
+            if f"</{tag}>" in xml_str[m.end():]:
+                continue
+            if self._inside_msg(xml_str[:m.start()]):
+                continue
+            if tag in self._registered_msg_tags or tag in self._registered_root_tags or tag in self.no_wrap_tags:
+                logger.debug(f"已补全未闭合的 root 级标签 <{tag}>")
+                return xml_str + f"</{tag}>"
+            logger.debug(f"已剥离未闭合的 root 级 <{tag}> 尾巴（其后内容无法安全切分）")
+            return xml_str[:m.start()]
+        return xml_str
+
+    def _protect_stray_blocks(self, xml_str: str) -> str:
+        """前置保护：处理文本中成对的非 msg 标签块，防止其内部干扰切块器与框架解析。
+
+        - msg 块：不动；
+        - 已注册/no_wrap 标签（file/record/mimo_tts 等 handler 会真正消费内容的）：
+          只中和 <msg、</msg> 边界字面量，内容字节级保留，绝不转义；
+        - 未注册标签（reasoning/think/foo 等框架本来就静默跳过的）：
+          内部先反转义再整体转义——<msg> 草稿失效化、裸特殊字符无害化，
+          框架 ET 解析不会被炸掉，且转义经 ET 往返无损。
+        """
+        def _repl(m):
+            tag, attrs, inner = m.group(1), m.group(2), m.group(3)
+            if tag == "msg":
+                return m.group(0)
+            if tag in self._registered_msg_tags or tag in self._registered_root_tags or tag in self.no_wrap_tags:
+                inner = inner.replace("</msg>", "&lt;/msg&gt;").replace("<msg", "&lt;msg")
+                return f"<{tag}{attrs}>{inner}</{tag}>"
+            inner = xml_unescape(inner, {"&quot;": '"', "&apos;": "'"})
+            return f"<{tag}{attrs}>{xml_escape(inner)}</{tag}>"
+        return self._STRAY_PAIR_RE.sub(_repl, xml_str)
+
+    def _fix_stray_segment(self, seg: str) -> list:
+        """处理 msg 之外的散段，按内容身份分流（对齐框架原生语义）：
+
+        - 已注册 root 标签：原样透传（框架按 RootTagAction 执行）；
+        - 已注册 msg 级/no_wrap 标签：包进 <msg> 走正常修复（模型忘包 msg 的
+          语音/图片/表情等得以生效，内容零转义）；
+        - 未注册标签块（reasoning/think/foo 等）：内部已在前置保护转义，
+          原样留在 root 级——框架静默跳过（用户不可见），原文形态进记忆；
+        - 松散文字：包 <msg><text> 发出（修掉消息）。
+        """
+        m = self._STRAY_SINGLE_BLOCK_RE.match(seg)
+        if m:
+            tag = m.group(1) or m.group(2)
+            if tag in self._registered_root_tags:
+                # 原样透传但过一道裸字符转义：属性/内容里的裸 & 会把框架 ET 解析炸掉
+                return [self._escape_specials(seg)]
+            if tag in self._registered_msg_tags or tag in self.no_wrap_tags:
+                return self._fix_single_msg(f"<msg>{seg}</msg>")
+            # 未注册：成对块内部已在前置保护转义；这里补上 attrs 与自闭合块的裸 &
+            return [self._escape_specials(seg)]
+        return self._fix_single_msg(seg)
 
     # ========== 裸特殊字符转义 ==========
 
@@ -529,29 +628,39 @@ class XmlTagFixerPlugin(BasePlugin):
                 return self._fallback_wrap(original)
 
     def fix_xml(self, xml_str: str) -> str:
-        xml_str = self._strip_reasoning(xml_str)
+        xml_str = self._escape_code_fences(xml_str)
+        if self.handle_stray_content:
+            xml_str = self._handle_unclosed_tail(xml_str)
+            xml_str = self._protect_stray_blocks(xml_str)
         if self.fix_double_brackets:
             xml_str = re.sub(r'<<(\w+)', r'<\1', xml_str)
 
         if xml_str.strip().startswith("[") and ("Error" in xml_str or "error" in xml_str):
             return xml_str
 
-        msg_blocks = []
+        # 位置感知切块：msg 块与散段（msg 前/之间/之后的内容）都保留，顺序不乱
+        segments = []  # (is_msg, text)
         start_pos = 0
         while True:
             idx = xml_str.find("<msg", start_pos)
             if idx == -1:
-                remainder = xml_str[start_pos:].strip()
-                if remainder:
-                    msg_blocks.append(remainder)
+                tail = xml_str[start_pos:]
+                if tail.strip():
+                    segments.append((False, tail))
                 break
+            if idx > start_pos:
+                gap = xml_str[start_pos:idx]
+                if gap.strip():
+                    segments.append((False, gap))
             open_end = xml_str.find(">", idx)
             if open_end == -1:
-                msg_blocks.append(xml_str[idx:])
+                segments.append((True, xml_str[idx:]))
                 break
             if xml_str[open_end - 1] == "/":
-                # 自闭合 <msg/> 或 <msg .../>：独立成块，避免吞掉后续消息
-                msg_blocks.append(xml_str[idx:open_end + 1])
+                # 自闭合 <msg/> 或 <msg .../>：独立成块，避免吞掉后续消息。
+                # 空消息 <msg/> 是合法的「静默」操作，原样透传：框架会自行优雅处理，
+                # 下游插件和记忆持久化都依赖这个标记
+                segments.append((True, xml_str[idx:open_end + 1]))
                 start_pos = open_end + 1
                 continue
             end_idx = xml_str.find("</msg>", open_end + 1)
@@ -559,21 +668,27 @@ class XmlTagFixerPlugin(BasePlugin):
             if end_idx == -1 or (next_open != -1 and next_open < end_idx):
                 # 未正常闭合（没有 </msg> 或闭合前出现新 <msg）：截断为独立块，走修复/兜底
                 cut = next_open if next_open != -1 else len(xml_str)
-                msg_blocks.append(xml_str[idx:cut])
+                segments.append((True, xml_str[idx:cut]))
                 start_pos = cut
                 continue
-            msg_blocks.append(xml_str[idx:end_idx + 6])
+            segments.append((True, xml_str[idx:end_idx + 6]))
             start_pos = end_idx + 6
 
         fixed_blocks = []
-        for block in msg_blocks:
-            block = block.strip()
-            if not block:
+        last_idx = len(segments) - 1
+        for i, (is_msg, seg) in enumerate(segments):
+            seg = seg.strip()
+            if not seg:
                 continue
-            result_list = self._fix_single_msg(block)
-            # 空消息 <msg/> 是合法的「静默」操作，原样透传：
-            # 框架会自行优雅处理，下游插件和记忆持久化都依赖这个标记
-            fixed_blocks.extend(result_list)
+            if is_msg:
+                fixed_blocks.extend(self._fix_single_msg(seg))
+            elif self.handle_stray_content:
+                fixed_blocks.extend(self._fix_stray_segment(seg))
+            elif i == last_idx:
+                # 开关关闭时保持旧行为：只有末尾残余散段会被救回，其余丢弃
+                fixed_blocks.extend(self._fix_single_msg(seg))
+            else:
+                logger.debug(f"已丢弃 msg 外的散段: {seg[:60]}")
         fixed_blocks = self._merge_marker_spanning_blocks(fixed_blocks)
         return "\n".join(fixed_blocks)
 
