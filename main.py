@@ -40,8 +40,10 @@ _BACKSLASH_TAG_RE = re.compile(r"<\\(/?)([a-zA-Z][\w-]*)>")
 #   - 没有标记 + 已显式配置  → 尊重用户选择，只打标记
 #   - 已有标记               → 什么都不做（用户之后怎么改都不再干预）
 _MIGRATION_KEY = "_migrated_strip_reasoning_default"
-_MIGRATION_VERSION = "1.5.0"
+_MIGRATION_VERSION = "1.5.1"
 _STRIP_KEY = "strip_reasoning_block"
+# v1.4.0 schema 的默认值（上游实测）。只有"当前值 == 这个"才迁移。
+_LEGACY_DEFAULT = True
 
 
 def _atomic_write_json(path, data) -> bool:
@@ -105,21 +107,32 @@ def migrate_config_once(config_path) -> Optional[str]:
     cfg = _read_json(config_path)
     if cfg is None:
         # 文件不存在 = 全新安装，schema 默认值即 false，无需迁移
-        if not os.path.isfile(str(config_path)):
-            return None
-        return None   # 存在但读不了 → 中止（绝不覆盖）
+        # 存在但读不了 → 中止（绝不覆盖）
+        return None
 
     if _MIGRATION_KEY in cfg:
-        return None   # 已迁移过，用户之后怎么改都不再干预
+        # ★ 已经迁移过 ⇒ 什么都不做。
+        # 这是"只做一次"的关键：用户之后手动把开关打开，重载/重启都不会被改回。
+        return None
 
     before = dict(cfg)
-    if _STRIP_KEY not in cfg:
-        # 用户从未显式配置过 → 采用新默认（关）
-        cfg[_STRIP_KEY] = False
-        action = "默认值迁移为 false（关闭 msg 外杂散内容）"
+    cur = cfg.get(_STRIP_KEY, _LEGACY_DEFAULT)
+
+    # 为什么不能靠"键是否存在"区分"用户配过"：
+    #   框架 _ensure_plugin_config 只要发现配置缺某个键，就会写入该键的
+    #   schema 默认值并立刻落盘 ⇒ 跑过 v1.4.0 的用户文件里**必然**已有
+    #   该键，值为 v1.4.0 的默认值 True。两者在文件里完全无法区分。
+    # 所以改用"值 == 旧版本默认值"当判据：
+    #   - 值为旧默认 True  → 极大概率是框架补的 ⇒ 迁移为 False
+    #   - 值已是 False     → 保持
+    #   - 键不存在         → 设为 False
+    # 代价：极少数**真的主动打开过**的用户会被改回 False（下面日志会提示怎么恢复）。
+    if cur is not _LEGACY_DEFAULT:
+        action = f"已是 {cur!r}，无需改动"
     else:
-        # 用户已显式配置过 → 尊重原值，只打标记
-        action = f"已显式配置为 {cfg[_STRIP_KEY]!r}，保留用户选择"
+        cfg[_STRIP_KEY] = False
+        action = ("由旧默认 true 迁移为 false（关闭 msg 外杂散内容；"
+                  "需要原来的行为请到 WebUI 重新打开该开关）")
 
     cfg[_MIGRATION_KEY] = _MIGRATION_VERSION
 
@@ -316,10 +329,10 @@ class XmlTagFixerPlugin(BasePlugin):
         self._run_config_migration()
         self._try_takeover_mimo()
 
-    def _run_config_migration(self):
-        """执行一次性配置迁移（幂等）。
+    def _run_config_migration(self) -> None:
+        """执行一次性配置迁移（幂等），并让当前会话立即采用迁移后的值。
 
-        只在本插件首次以 1.5.0 运行时生效一次；之后无论用户怎么改都不再干预。
+        只在本插件首次以 1.5.1 运行时生效一次；之后无论用户怎么改都不再干预。
         迁移失败一律静默降级（保持原配置与原行为），绝不影响插件可用性。
         """
         try:
@@ -327,7 +340,17 @@ class XmlTagFixerPlugin(BasePlugin):
             if path is None:
                 logger.debug("[xml_tag_fixer] 无法定位插件配置文件，跳过迁移")
                 return
-            migrate_config_once(path)
+            action = migrate_config_once(path)
+            if action is None:
+                return
+            # ★ 迁移改的是文件，但本实例的 handle_stray_content 在 __init__
+            #    时就读定了 ⇒ 必须回填，否则要等下次重载才生效（实测确认）。
+            #    重读文件而不是直接用 False：迁移也可能是"保持原值"。
+            cfg = _read_json(path)
+            if isinstance(cfg, dict) and _STRIP_KEY in cfg:
+                self.handle_stray_content = cfg[_STRIP_KEY]
+                logger.info(f"[xml_tag_fixer] 迁移后当前会话立即采用 {_STRIP_KEY}="
+                            f"{self.handle_stray_content}")
         except Exception as e:
             logger.error(f"[xml_tag_fixer] 配置迁移异常（已忽略，保持原配置）: {e}")
 
@@ -577,19 +600,16 @@ class XmlTagFixerPlugin(BasePlugin):
     def _handle_unclosed_tail(self, xml_str: str) -> str:
         """处理 root 级未闭合的非 msg 标签尾巴。
 
-        已注册/no_wrap 标签：补上闭合标签救回内容（如模型没写完的 mimo_tts）；
-        未注册标签（reasoning 等）：剥到末尾——其后可能混着真消息，无法安全切分，
-        且框架原生遇到未闭合会整段解析失败，剥离是损失更小的选择；
-        msg 内部的未闭合标签不动（留给解析失败 → 兜底管线）。
+        - **已注册/no_wrap 标签**：补上闭合标签救回内容（如模型没写完的 mimo_tts）
+        - **未注册标签**（reasoning/think 等框架本来就静默跳过的）：
+          在**该标签最后一个闭合标签处**补上闭合，把它封成一个完整块。
+          该块随后由 _protect_stray_blocks 内部转义 ⇒ 用户看不到、不会污染
+          结果，且**不吞掉其后紧跟的真消息**。
+          （旧行为是"剥到末尾"，会把后面的真消息一起删掉 —— 那是内容丢失。）
+        - msg 内部的未闭合标签不动（留给解析失败 → 兜底管线）
 
-        两个必须注意的点：
-        1. **必须循环**：旧版处理完第一个就 return，多标签场景
-           （如 `<record url="a"><record url="b">`）留下嵌套未闭合标签
-           ⇒ 最终仍不可解析。这里补到再无可补为止（带上限防死循环）。
-        2. **闭合判断必须做深度配对**：同名嵌套时第一个 `</record>` 关的是内层，
-           用 `f"</{tag}>" in rest` 这种全局包含判断会把内层误当成外层已闭合。
-        3. **补闭合要考虑嵌套深度**：`<record a><record b>` 需要补两次，
-           只补一次仍然不平衡。
+        无论「处理 msg 外杂散内容」开关如何，这一步都必须执行：
+        它的首要职责是**防止坏结构破坏解析**，而不是决定内容去留。
         """
         for _ in range(64):
             target = None
@@ -597,7 +617,6 @@ class XmlTagFixerPlugin(BasePlugin):
                 tag = m.group(1)
                 if tag == "msg" or m.group(2) == "/":
                     continue
-                # 该开口有没有配对的闭合（深度配对，不是全局包含）
                 if self._find_matching_close(tag, xml_str, m.end()) is not None:
                     continue
                 if self._inside_msg(xml_str[:m.start()]):
@@ -613,8 +632,22 @@ class XmlTagFixerPlugin(BasePlugin):
                 logger.debug(f"已补全 root 级未闭合标签 <{tag}>")
                 xml_str = xml_str + f"</{tag}>"
             else:
-                logger.debug(f"已剥离未闭合的 root 级 <{tag}> 尾巴（其后内容无法安全切分）")
-                xml_str = xml_str[:m.start()]
+                # 未注册标签：优先在它自己的闭合标签处封口，保全其后内容
+                last_close = xml_str.rfind(f"</{tag}>")
+                if last_close != -1:
+                    insert_at = last_close + len(tag) + 3
+                    logger.debug(f"已在末尾闭合处补全未闭合的未注册标签 <{tag}>")
+                    xml_str = xml_str[:insert_at] + f"</{tag}>" + xml_str[insert_at:]
+                else:
+                    # 完全没有闭合标签：**在下一个真消息（`<msg`）之前补上闭合**，
+                    # 让它仍是一个完整的未注册标签块。
+                    # 为什么不是简单删掉开标签：删掉后里面的思考文字会变成裸文本，
+                    # 总开关打开时会被当消息发出（泄漏）；也不是"剥到末尾"，
+                    # 那会把后面紧跟的真消息一起删掉。
+                    nxt_msg = xml_str.find("<msg", m.end())
+                    insert_at = nxt_msg if nxt_msg != -1 else len(xml_str)
+                    logger.debug(f"已在下一个消息前补全未闭合的未注册标签 <{tag}>")
+                    xml_str = xml_str[:insert_at] + f"</{tag}>" + xml_str[insert_at:]
         return xml_str
 
     def _protect_stray_blocks(self, xml_str: str) -> str:
@@ -644,8 +677,10 @@ class XmlTagFixerPlugin(BasePlugin):
         m = XmlTagFixerPlugin._STRAY_SINGLE_BLOCK_RE.match(seg)
         return (m.group(1) or m.group(2)) if m else None
 
-    def _is_lost_functional_tag(self, seg: str) -> bool:
-        """该散段是「不应被丢弃的功能性内容」吗。
+    def _passes_through_when_off(self, seg: str) -> bool:
+        """关闭总开关时，该散段是否应当保留（而不是丢弃）。
+
+        该散段是「不应被丢弃的功能性内容」吗。
 
         关闭「处理 msg 外杂散内容」时，旧行为会把 msg 之间的散段整体丢弃。
         但其中两类散段是**真实的修复目标**，丢掉等于功能静默失效：
@@ -667,6 +702,12 @@ class XmlTagFixerPlugin(BasePlugin):
                 return True
             if tag in self._registered_msg_tags or tag in self.no_wrap_tags:
                 return True
+            # 未注册标签块（reasoning/think 等）：**也保留**，但处理方式不同 ——
+            # 由调用方原样透传（框架对其"静默跳过"：用户看不到，原文进记忆），
+            # 让模型在历史里仍能看到自己包规划的范例。
+            # ⚠ 安全性由 _protect_stray_blocks 保证：它已把块内的 <msg> 草稿
+            #    转义成 &lt;msg&gt;，所以透传不会被误当真消息发送。
+            return True
         # 含 [xxx] / [/xxx] 协议标记的文本（折扇留穗等插件依赖）
         if self.merge_marker_span_msgs and self._BBCODE_MARKER_RE.search(seg):
             return True
@@ -1336,9 +1377,12 @@ class XmlTagFixerPlugin(BasePlugin):
         return as_tag
 
     def _fix_xml_core(self, xml_str: str) -> str:
-        if self.handle_stray_content:
-            xml_str = self._handle_unclosed_tail(xml_str)
-            xml_str = self._protect_stray_blocks(xml_str)
+        # ★ 这两步都必须**无条件**执行，不能受总开关影响：
+        #   它们的职责是"防止坏结构破坏解析 / 防止草稿被当真消息"，
+        #   属于结构保护，不决定内容对外可见性（可见性由散段分流决定）。
+        #   实测把 _protect_stray_blocks 放进开关内会让 OFF 泄漏 reasoning 里的草稿。
+        xml_str = self._handle_unclosed_tail(xml_str)
+        xml_str = self._protect_stray_blocks(xml_str)
         xml_str = self._fix_double_brackets_safe(xml_str)
 
         if xml_str.strip().startswith("[") and ("Error" in xml_str or "error" in xml_str):
@@ -1358,14 +1402,27 @@ class XmlTagFixerPlugin(BasePlugin):
                 fixed_blocks.extend(self._fix_single_msg(seg))
             elif self.handle_stray_content:
                 fixed_blocks.extend(self._fix_stray_segment(seg))
-            elif self._is_lost_functional_tag(seg):
-                # 关闭总开关时仍补包「忘带 msg 的已注册功能标签」——
-                # 语音/图片/@/表情是真实的修复目标，不是"心声"，
-                # 丢弃它们属于功能静默丢失。这是细粒度分流：
-                # 只丢裸文本（疑似心声），保功能标签。
+            elif self._passes_through_when_off(seg):
+                # 关闭总开关时的散段分流：
+                #   ① 未注册标签块（reasoning/think）→ **原样透传**。
+                #      框架对 root 级未注册标签本来就是「静默跳过」——
+                #      用户看不到，但原文进记忆。保留它能让模型在历史里
+                #      看到自己用 <reasoning> 包规划的范例，约定不丢
+                #      （v1.2.1 正是为这个才从"剥离"改成"保留"）。
+                #      ⚠ 前置的 _protect_stray_blocks 已把内部草稿 <msg> 转义，
+                #        所以透传不会让草稿被误发。
+                #   ② 忘带 msg 的已注册功能标签（语音/图片/@/表情）→ 补包。
+                #      它们是真修复目标，丢弃属于功能静默丢失。
+                #   ③ 含 [xxx] 标记的文本 → 补包，保折扇留穗等插件的跨消息协议。
                 tag = self._stray_block_tag(seg)
-                logger.debug(f"补包忘带 msg 的功能标签 <{tag}>（散段处理已关闭）")
-                fixed_blocks.extend(self._fix_single_msg(f"<msg>{seg}</msg>"))
+                if tag and tag not in self._registered_msg_tags \
+                        and tag not in self._registered_root_tags \
+                        and tag not in self.no_wrap_tags:
+                    logger.debug(f"原样透传未注册标签 <{tag}>（用户不可见、原文进记忆）")
+                    fixed_blocks.append(seg)
+                else:
+                    logger.debug(f"补包散段的功能内容 <{tag}>（散段处理已关闭）")
+                    fixed_blocks.extend(self._fix_single_msg(f"<msg>{seg}</msg>"))
             elif i == last_idx:
                 # 开关关闭时保持旧行为：只有末尾残余散段会被救回，其余丢弃
                 fixed_blocks.extend(self._fix_single_msg(seg))

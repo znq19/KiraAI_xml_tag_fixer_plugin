@@ -522,6 +522,7 @@ python3 /tmp/h/fuzz.py
 | [main.py](minis://shared/work/xmlfix_patched/main.py) | v1.5.0 实现 |
 | [tests/test_fixer.py](minis://shared/work/xmlfix_patched/tests/test_fixer.py) | 160 条断言自检套件 |
 | [tests/test_migration.py](minis://shared/work/xmlfix_patched/tests/test_migration.py) | 23 条配置迁移断言 |
+| [tests/test_unregistered_tags.py](minis://shared/work/xmlfix_patched/tests/test_unregistered_tags.py) | 59 条未注册标签断言 |
 | [tests/verify_design_intent.py](minis://shared/work/xmlfix_patched/tests/verify_design_intent.py) | 30 条设计理念保真断言 |
 | [tests/verify_no_slow_path.py](minis://shared/work/xmlfix_patched/tests/verify_no_slow_path.py) | 慢速路径拦截验证（17 场景） |
 | [schema.json](minis://shared/work/xmlfix_patched/schema.json) | 新增 `fix_backslash_tags` |
@@ -619,6 +620,141 @@ python3 /tmp/h/fuzz.py
 5. 任何一步失败 → 放弃迁移，保持原文件不变
 
 `tests/test_migration.py` 用 **23 条断言**覆盖上述全部分支（含失败注入）。
+
+## 六·七、未注册标签（reasoning/thinking）行为修正 → 1.5.1
+
+用户追问后做的专项审计，**又抓出 2 个真问题**：
+
+### 问题① OFF 时 reasoning 里的 msg 草稿被当真消息发出
+
+`_protect_stray_blocks`（负责把未注册标签内部的 `<msg>` 转义掉）被写在
+总开关的 `if` 里 ⇒ **关掉开关就不执行保护** ⇒ 块里的草稿被切块器当成真消息边界：
+
+| 输入 | 修复前 OFF | 修复后 OFF |
+|---|---|---|
+| `<reasoning>草稿<msg><text>示例</text></msg></reasoning><msg><text>正式</text></msg>` | `示例` + `正式` ← **草稿泄漏** | 只有 `正式` ✓ |
+
+**修法**：`_handle_unclosed_tail` 与 `_protect_stray_blocks` 都改为**无条件执行** ——
+它们的职责是"防止坏结构破坏解析 / 防止草稿被误发"，属于结构保护，
+不决定内容对外可见性（可见性由散段分流决定）。
+
+### 问题② ON 时未闭合 reasoning 把后面的真消息吞掉
+
+`_handle_unclosed_tail` 对未注册标签原本是"**剥到末尾**"：
+
+| 输入 | 修复前 ON | 修复后 ON |
+|---|---|---|
+| `<reasoning>我在想……<msg><text>真消息</text></msg>` | **(无)** ← **真消息丢了** | `真消息` ✓ |
+
+**修法**：未注册标签不再"剥到末尾"，而是**在下一个真消息（`<msg`）之前补上闭合**，
+让它仍是一个完整的未注册标签块。
+
+> 中间试过"只删开标签保留内容"——结果思考文字变成裸文本，
+> 总开关打开时照样泄漏。**必须补闭合封块**，而不是拆掉标签。
+
+### 附带恢复：未注册标签块在 OFF 时也保留
+
+原 v1.2.1 特意把 reasoning 从"剥离"改成"保留"，理由很明确：
+剥离后模型在历史里看不到自己包规划的范例，**会逐渐忘记这个约定**。
+
+我把它恢复成 OFF 时也**原样透传**（框架对 root 级未注册标签本来就是
+"静默跳过"：用户看不到、原文进记忆）。安全性由 `_protect_stray_blocks` 保证。
+
+### 最终行为矩阵（21 个场景 × ON/OFF）
+
+| 输入 | ON 发出 | OFF 发出 |
+|---|---|---|
+| `<reasoning>我该先搜索</reasoning><msg>好嘞</msg>` | 好嘞 | 好嘞 |
+| `<reasoning>想想</reasoning>让我想想该查一下<msg>今天晴</msg>` | 让我想想该查一下 + 今天晴 | 今天晴 |
+| `<reasoning>草稿<msg>示例</msg></reasoning><msg>正式</msg>` | 正式 | **正式** |
+| `<reasoning>我在想……<msg>真消息</msg>` | 真消息 | 真消息 |
+| `<msg>A</msg><reasoning>中间思考</reasoning><msg>B</msg>` | A + B | A + B |
+| `<msg><reasoning>内部思考</reasoning><text>正文</text></msg>` | 正文 | 正文 |
+
+**心声泄漏：ON 1 处 / OFF 0 处**；**真消息丢失：两边都是 0**。
+
+`tests/test_unregistered_tags.py` 用 **59 条断言**覆盖上述全部场景。
+
+## 六·八、配置迁移失效修复（1.5.1，用户追问后发现）
+
+### 问题①：迁移判断不出「用户从没配过」—— 对老用户完全没生效
+
+我原本的设计假设是「配置里没有该键 = 用户从没配过」。**这个假设在框架里不成立**：
+
+```python
+# core/plugin/plugin_registry.py:_ensure_plugin_config
+for field in schema_fields:
+    elif isinstance(field, BaseConfigField) and field.key not in cfg:
+        cfg[field.key] = field.default        # 缺失就写默认值
+with config_path.open("w", ...) as f:
+    json.dump(cfg, f, ...)                    # 而且立刻落盘
+```
+
+它**每次加载插件都会把缺失的键用默认值补齐并写回文件**。而 v1.4.0 的 schema
+默认值是 **`True`** ⇒ **任何跑过 v1.4.0 的用户，文件里必然已有
+`strip_reasoning_block: true`**。
+
+于是迁移看到「键已存在」→ 判定为「用户显式配置过」→ **保留 `True`** → 迁移等于没做。
+
+实测：
+
+| 场景 | 1.5.0 迁移后 | 说明 |
+|---|---|---|
+| 键不存在（几乎不可能） | `False` ✓ | 只在凭空构造时出现 |
+| **值为 True（老用户真实情况）** | **`True` ✗** | **心声照旧泄漏** |
+| 值为 False | `False` ✓ | |
+
+**为什么之前的测试没抓到**：我在测试里构造的「老用户配置」**故意不含该键** ——
+那是我凭空设想的样子，不是真实用户的样子。**测试构造失真掩盖了这个 bug。**
+
+### 修法：改用「值」判断
+
+文件里无法区分「框架补的 `True`」与「用户主动配的 `True`」，
+但**我们知道 v1.4.0 的默认值就是 `True`**：
+
+| 升级前文件里的值 | 动作 |
+|---|---|
+| `true`（= 旧默认，大概率框架补的） | **改为 `false`** |
+| `false` | 保持 |
+| 键不存在 | 设为 `false` |
+
+**代价**：极少数**真的主动打开过**的用户会被改回一次，日志与 README 都会提示怎么恢复。
+
+### 问题②：迁移对当前会话不生效
+
+```python
+async def initialize(self):
+    logger.info(f"... stray={self.handle_stray_content}")   # ① 已读定配置
+    self._run_config_migration()                            # ② 才改文件
+```
+
+`self.handle_stray_content` 在 `__init__` 就定下来了，迁移改的是文件
+⇒ **当前会话仍用旧值**，要等下次重载。实测确认。
+
+**修法**：迁移后**重读文件并回填实例**（不是直接写 `False`，
+因为迁移也可能是"保持原值"）。
+
+> 顺带发现并修掉一个**死 import**：`_run_config_migration` 里有一句
+> `from core.utils.path_utils import get_config_path  # noqa: F401`
+> 在 harness 下会抛 `ModuleNotFoundError`，被 `except` 吞掉 ⇒ **整个回填逻辑被跳过**。
+> 这正是问题②在测试里仍失败的原因。
+
+### 「只做一次」的不变量（用户特别要求）
+
+用户明确要求：**迁移后他手动打开开关，重载不得再被改回**。
+
+`tests/test_migration.py` 用 **M4/M5** 锁定该不变量：
+迁移 → 手动改 `true` → **连续重载 5 次**（每次都会跑迁移）→ 值仍为 `true`。
+
+### 测试扩写（23 → 28 条断言）
+
+| 编号 | 覆盖 |
+|---|---|
+| M1 | ★ 老用户（框架补的 True）→ 迁移为 False |
+| M2 / M3 | 已关 / 缺键 的处理 |
+| **M4 / M5** | ★ **只做一次**：手动开启后重载 5 次不被改回 |
+| **M6** | ★ 迁移对当前实例**立即生效** |
+| M7~M13 | 文件不存在 / 损坏 / 写失败 / 其它键保留 / 写回可读 / 幂等 / 无临时文件残留 |
 
 ## 七、还没做的（需要你确认）
 
