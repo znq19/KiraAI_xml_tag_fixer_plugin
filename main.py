@@ -15,6 +15,9 @@ PLUGIN_ID = "xml_tag_fixer"
 
 # MiMo TTS 插件的 plugin_id（用于接管其格式修复功能）
 MIMO_PLUGIN_ID = "kira-ai-plugin-mimo-tts"
+# 可选流式协同：acc 抢发 / QQ 官方 bot 的 token 预览（特征探测，缺失时零影响）
+ACC_PLUGIN_ID = "kira_accelerator"
+QQBOT_PLUGIN_ID = "qqbot-fullmsg-bridge"
 
 # 切块器用的 <msg> 扫描正则（模块级，避免每次调用重复编译）
 # 属性部分懒惰匹配，且不吞掉自闭合的 /（对齐原实现的开口识别口径）
@@ -24,6 +27,18 @@ _MSG_ANY_SEARCH_RE = re.compile(r"<msg(?:\s[^>]*?)?(/?)>|</msg\s*>")
 # 标签定界符修复：`<<msg`（首尖括号打重）与 `<\/msg>`（反斜杠转义）
 _DBL_ANGLE_RE = re.compile(r"<<(\w+)")
 _BACKSLASH_TAG_RE = re.compile(r"<\\(/?)([a-zA-Z][\w-]*)>")
+
+# 最终可见文本里的孤儿残片：任意完整闭合标签，或工具协议特有的截断尾部。
+# 只在整行/整条完全由这些 token 组成时清理，绝不做行内替换。
+_VISIBLE_DEBRIS_TOKEN_RE = re.compile(
+    r"(?:</([a-zA-Z_][\w.:-]*)[ \t]*>"
+    r"|((?:tool_calls|function_calls|calls|functions|invoke|parameter)[ \t]*>))",
+    re.IGNORECASE,
+)
+_VISIBLE_TOOL_DEBRIS_NAMES = frozenset({
+    "tool_calls", "function_calls", "calls", "functions", "invoke", "parameter",
+})
+_VISIBLE_TOOL_FRAGMENT_MARKERS = ("calls", "invoke", "parameter", "functions")
 
 # ========== 一次性配置迁移 ==========
 #
@@ -244,6 +259,11 @@ class XmlTagFixerPlugin(BasePlugin):
         self._rescue_notes = []      # 待注入的当轮提示（下轮 on_llm_request 消费）
 
         self._mimo_checked = False
+        # 流式协同只保存“自己挂上去的那一层”，卸载时绝不误拆其他插件包装。
+        self._acc_instance = None
+        self._acc_original_make_engine = None
+        self._qq_preview_instance = None
+        self._qq_preview_original = None
 
     # ========== 标签定界符修复（双尖括号 / 反斜杠转义）==========
 
@@ -353,6 +373,7 @@ class XmlTagFixerPlugin(BasePlugin):
                     f"tool_rescue={self.tool_tag_rescue and self._rescue is not None})")
         self._run_config_migration()
         self._try_takeover_mimo()
+        self._try_attach_stream_peers()
 
     def _run_config_migration(self) -> None:
         """执行一次性配置迁移（幂等），并让当前会话立即采用迁移后的值。
@@ -394,6 +415,7 @@ class XmlTagFixerPlugin(BasePlugin):
             return None
 
     async def terminate(self):
+        self._detach_stream_peers()
         if self._rescue is not None:
             try:
                 self._rescue.uninstall()
@@ -404,8 +426,9 @@ class XmlTagFixerPlugin(BasePlugin):
 
     @on.loaded()
     async def _on_loaded(self, *_):
-        # 所有插件加载完成后再检测一次（覆盖 mimo 比本插件后加载的情况）
+        # 所有插件加载完成后再检测一次（覆盖协同插件比本插件后加载的情况）
         self._try_takeover_mimo()
+        self._try_attach_stream_peers()
 
     def _try_takeover_mimo(self):
         """接管 MiMo TTS 插件的格式修复：将其 auto_format_fix 运行时置 False。
@@ -429,6 +452,186 @@ class XmlTagFixerPlugin(BasePlugin):
                 inst.auto_format_fix = False
                 logger.info("已接管 MiMo TTS 的格式修复（标签摊平 + 语音拆分由本插件处理），"
                             "mimo 插件的 auto_format_fix 已运行时关闭")
+
+    # ========== 可选流式协同（acc 抢发 / QQ 官方 token 预览）==========
+
+    def _try_attach_stream_peers(self):
+        """在请求开始前挂接流式协同；插件不存在/接口变化时自然跳过。"""
+        if not self.enabled:
+            return
+        for attach in (self._try_attach_acc, self._try_attach_qq_preview):
+            try:
+                attach()
+            except Exception:
+                logger.debug(f"[xml_tag_fixer] 流式协同挂接跳过: {attach.__name__}",
+                             exc_info=True)
+
+    def _try_attach_acc(self):
+        """包装 acc 的引擎工厂：抢发前清残片，完成时接工具搭救。
+
+        只操作当前 acc 实例；原 emit/on_complete 全部保留。正常段内容不变，
+        纯残片按“已处理但无需投递”返回 True，让 acc 的防重复台账保持一致。
+        """
+        try:
+            inst = self.ctx.get_plugin_inst(ACC_PLUGIN_ID)
+        except Exception:
+            return
+        if inst is None:
+            return
+        current = getattr(inst, "_make_engine", None)
+        if not callable(current):
+            return
+        if getattr(current, "_xtf_acc_owner", None) is self:
+            self._acc_instance = inst
+            self._acc_original_make_engine = current._xtf_acc_original
+            return
+        if self._acc_instance is inst:
+            return  # 后续另有包装：不重复叠加，也不误拆别人的层
+        original = getattr(current, "_xtf_acc_original", current)
+
+        def make_engine(request=None):
+            engine = original(request)
+            try:
+                self._instrument_acc_engine(engine, request)
+            except Exception:
+                logger.exception("[xml_tag_fixer] acc 引擎协同异常（按原引擎放行）")
+            return engine
+
+        make_engine._xtf_acc_owner = self
+        make_engine._xtf_acc_original = original
+        inst._make_engine = make_engine
+        self._acc_instance = inst
+        self._acc_original_make_engine = original
+        logger.info("[xml_tag_fixer] 已接入 acc 抢发残片清理与工具搭救协同")
+
+    def _instrument_acc_engine(self, engine, request):
+        if getattr(engine, "_xtf_acc_instrumented", False):
+            return
+        original_emit = getattr(engine, "emit", None)
+        if callable(original_emit):
+            async def emit_clean(seg):
+                if not self.enabled:
+                    return await original_emit(seg)
+                try:
+                    cleaned = "\n".join(self._clean_orphan_debris_blocks([seg]))
+                except Exception:
+                    logger.exception("[xml_tag_fixer] acc 抢发清理异常（按原段放行）")
+                    return await original_emit(seg)
+                if not cleaned:
+                    # 纯残片不投递，但必须让 acc 视为已消费，避免后续引擎停发/框架重发。
+                    logger.debug("[xml_tag_fixer] acc 抢发段仅含残片，已静默消费")
+                    return True
+                return await original_emit(cleaned)
+            engine.emit = emit_clean
+
+        previous = getattr(engine, "on_complete", None)
+        rescue = self._rescue
+
+        def complete(resp):
+            try:
+                # 与普通 chat 包装同一请求级闸门：摘要/决策等无工具直调不翻译。
+                if self.enabled and rescue is not None and (
+                        getattr(request, "tools", None) or getattr(request, "tool_set", None)):
+                    rescue.translate(resp)
+            except Exception:
+                logger.exception("[xml_tag_fixer] acc 工具搭救异常（保留原响应）")
+            try:
+                # acc 台账原本记录未清理段；若本轮会经过最终修复，必须同步成同一形态，
+                # 否则“抢发的是清理文、台账是原始文”会导致混合正文段剥离失败并重复。
+                # only_final 跳过带工具步时保留原台账，因为最终 text_response 不会被改写。
+                if self.enabled and not (self.only_final and getattr(resp, "tool_calls", None)):
+                    segs = getattr(resp, "_accel_early_sent_segments", None)
+                    if isinstance(segs, list):
+                        resp.__dict__["_accel_early_sent_segments"] = [
+                            "\n".join(self._clean_orphan_debris_blocks([seg])) for seg in segs
+                        ]
+            except Exception:
+                logger.exception("[xml_tag_fixer] acc 抢发台账规范化异常（保留原台账）")
+            if previous is not None:
+                previous(resp)
+        engine.on_complete = complete
+        engine._xtf_acc_instrumented = True
+
+    def _try_attach_qq_preview(self):
+        """清理 QQ 官方 bot 的 token 预览文字，不碰原始 XML 与权威发送。"""
+        try:
+            inst = self.ctx.get_plugin_inst(QQBOT_PLUGIN_ID)
+        except Exception:
+            return
+        manager = getattr(inst, "c2c_stream", None) if inst is not None else None
+        current = getattr(manager, "observe_raw", None)
+        if not callable(current):
+            return
+        if getattr(current, "_xtf_qq_owner", None) is self:
+            self._qq_preview_instance = manager
+            self._qq_preview_original = current._xtf_qq_original
+            return
+        if self._qq_preview_instance is manager:
+            return
+        original = getattr(current, "_xtf_qq_original", current)
+        func = getattr(original, "__func__", original)
+        display = getattr(func, "__globals__", {}).get("display_text_of")
+        if not callable(display):
+            return
+
+        def observe_raw(adapter, client, target, msg_id, raw):
+            if not self.enabled:
+                return original(adapter, client, target, msg_id, raw)
+            # 原始 `</use>` 本就会被 display_text_of 截掉；只检查实体和工具截断候选。
+            if raw and not any(x in raw for x in ("&lt;", "&gt;", "&#")):
+                folded = raw.lower()
+                if not any(x in folded for x in _VISIBLE_TOOL_FRAGMENT_MARKERS):
+                    return original(adapter, client, target, msg_id, raw)
+            try:
+                shown = display(raw)
+                if not self.fallback_strip_tags:
+                    return original(adapter, client, target, msg_id, raw)
+                decoded = xml_unescape(shown, {"&quot;": '"', "&apos;": "'"})
+                cleaned = self._clean_orphan_debris_text(decoded)
+                if cleaned == decoded:
+                    cleaned = shown       # 普通实体正文保持原预览，不做额外规范化
+            except Exception:
+                return original(adapter, client, target, msg_id, raw)
+            if cleaned == shown:
+                return original(adapter, client, target, msg_id, raw)
+            if not cleaned:
+                return None               # 纯残片预览不创建流，也不留下垃圾帧
+            result = original(adapter, client, target, msg_id, raw)
+            try:
+                # observe_raw 是同步函数；在后台 flusher 运行前替换为权威清理文本。
+                sess = manager._sessions.get(target)
+                if sess is not None and sess.value == shown:
+                    sess.value = cleaned
+            except Exception:
+                logger.debug("[xml_tag_fixer] QQ 预览清理后同步失败（保留原流程）",
+                             exc_info=True)
+            return result
+
+        observe_raw._xtf_qq_owner = self
+        observe_raw._xtf_qq_original = original
+        manager.observe_raw = observe_raw
+        self._qq_preview_instance = manager
+        self._qq_preview_original = original
+        logger.info("[xml_tag_fixer] 已接入 QQ 官方 bot 流式预览残片清理")
+
+    def _detach_stream_peers(self):
+        """只还原本实例装上的包装；其他插件后装的层不动。"""
+        inst, original = self._acc_instance, self._acc_original_make_engine
+        if inst is not None and original is not None:
+            try:
+                if getattr(inst._make_engine, "_xtf_acc_owner", None) is self:
+                    inst._make_engine = original
+            except Exception:
+                logger.debug("[xml_tag_fixer] acc 协同卸载跳过", exc_info=True)
+        manager, original = self._qq_preview_instance, self._qq_preview_original
+        if manager is not None and original is not None:
+            try:
+                if getattr(manager.observe_raw, "_xtf_qq_owner", None) is self:
+                    manager.observe_raw = original
+            except Exception:
+                logger.debug("[xml_tag_fixer] QQ 预览协同卸载跳过", exc_info=True)
+        self._acc_instance = self._acc_original_make_engine = None
+        self._qq_preview_instance = self._qq_preview_original = None
 
     # ========== 代码围栏感知转义 ==========
 
@@ -483,6 +686,8 @@ class XmlTagFixerPlugin(BasePlugin):
         已注册标签（内置 text/record/file 及插件注册的 mimo_tts 等）内容绝不转义；
         未注册标签（reasoning/think/foo 等）内部整体转义后原样保留。
         """
+        # 协同插件可能刚重载：请求前重挂到新实例，当前这轮流式输出即受保护。
+        self._try_attach_stream_peers()
         try:
             self._registered_msg_tags = {t.name for t in tag_set.get_all()}
             self._registered_root_tags = {t.name for t in tag_set.get_all_root()}
@@ -1275,6 +1480,151 @@ class XmlTagFixerPlugin(BasePlugin):
             parts[i] = self._strip_structural_tags(parts[i])
         return "```".join(parts)
 
+    def _is_orphan_debris_line(self, line: str) -> bool:
+        """整行是否只由孤儿闭合标签/工具截断 token 组成。
+
+        任意 `</xxx>` 都可判定为孤儿残片；`calls>` 这类没有 `<` 的形态
+        只接受明确的工具协议词。多个 token 可位于同一行，但不允许夹杂任何
+        普通文字、标点或比较表达式，从判据上避免行内误删。
+        """
+        body = line.rstrip("\r\n").strip(" \t")
+        if not body:
+            return False
+        pos = 0
+        found = False
+        while pos < len(body):
+            m = _VISIBLE_DEBRIS_TOKEN_RE.match(body, pos)
+            if not m:
+                return False
+            close_name, fragment_name = m.groups()
+            name = (close_name or fragment_name).lower()
+            if fragment_name is not None and not self.strip_tool_debris:
+                return False
+            if close_name is not None and not self.strip_tool_debris \
+                    and name in _VISIBLE_TOOL_DEBRIS_NAMES:
+                return False
+            found = True
+            pos = m.end()
+            if pos < len(body):
+                if body[pos] not in " \t":
+                    return False
+                while pos < len(body) and body[pos] in " \t":
+                    pos += 1
+        return found
+
+    @staticmethod
+    def _orphan_debris_code_spans(text: str) -> list:
+        """返回代码围栏与行内代码的保护区；未闭合围栏保护到文本末尾。"""
+        spans = []
+        i = 0
+        n = len(text)
+        while i < n:
+            if text.startswith("```", i):
+                end = text.find("```", i + 3)
+                stop = n if end == -1 else end + 3
+                spans.append((i, stop))
+                i = stop
+                continue
+            if text[i] == "`":
+                j = i + 1
+                while j < n and text[j] == "`":
+                    j += 1
+                ticks = text[i:j]
+                end = text.find(ticks, j)
+                if end != -1:
+                    stop = end + len(ticks)
+                    spans.append((i, stop))
+                    i = stop
+                else:
+                    i = j
+                continue
+            i += 1
+        return spans
+
+    def _clean_orphan_debris_text(self, text: str) -> str:
+        """仅删除代码区外、独立成行的残片，其他字符与原换行保持不变。"""
+        if not text or ">" not in text:
+            return text
+        spans = self._orphan_debris_code_spans(text)
+        parts = []
+        changed = False
+        pos = 0
+        for line in text.splitlines(keepends=True):
+            end = pos + len(line)
+            in_code = any(pos < b and end > a for a, b in spans)
+            if not in_code and self._is_orphan_debris_line(line):
+                changed = True
+            else:
+                parts.append(line)
+            pos = end
+        return "".join(parts) if changed else text
+
+    @staticmethod
+    def _remove_text_preserve_tail(root: ET.Element, child: ET.Element) -> None:
+        """删除空 text 节点时保留格式化 tail，避免改变后续节点位置。"""
+        children = list(root)
+        idx = children.index(child)
+        tail = child.tail or ""
+        if tail:
+            if idx:
+                prev = children[idx - 1]
+                prev.tail = (prev.tail or "") + tail
+            else:
+                root.text = (root.text or "") + tail
+        root.remove(child)
+
+    def _clean_orphan_debris_blocks(self, blocks: list) -> list:
+        """在最终可见 `<text>` 层清理孤儿残片；未命中块逐字节原样返回。
+
+        真正的功能标签仍是 XML 元素，不在清理面上。只有已经退化为正文、
+        且独立成行的残片才会命中。显式保真模式优先，不做这层内容清理。
+        """
+        if not self.fallback_strip_tags:
+            return blocks
+        result = []
+        for block in blocks:
+            if not any(x in block for x in ("&lt;", "&gt;", "&#")):
+                # 只有可能出现工具词时才进入 ET 检查；普通长消息不做全文 regex 扫描。
+                folded = block.lower()
+                if not any(x in folded for x in _VISIBLE_TOOL_FRAGMENT_MARKERS):
+                    result.append(block)
+                    continue
+            try:
+                root = ET.fromstring(block)
+            except ET.ParseError:
+                result.append(block)
+                continue
+            if root.tag != "msg":
+                result.append(block)
+                continue
+
+            original_children = list(root)
+            text_only = bool(original_children) and all(c.tag == "text" for c in original_children)
+            changed = False
+            for child in original_children:
+                if child.tag != "text":
+                    continue
+                before = child.text or ""
+                after = self._clean_orphan_debris_text(before)
+                if after != before:
+                    child.text = after
+                    changed = True
+            if not changed:
+                result.append(block)
+                continue
+
+            # 纯残片消息整块省略；含其他功能元素的消息只删空 text，功能不受影响。
+            if text_only and not any(
+                    (c.text or "").strip() or (c.tail or "").strip() for c in root):
+                logger.debug("已省略仅含孤儿标签残片的消息块")
+                continue
+            for child in list(root):
+                if child.tag == "text" and not (child.text or "").strip():
+                    self._remove_text_preserve_tail(root, child)
+            result.append(ET.tostring(root, encoding="unicode", method="xml"))
+            logger.debug("已清理最终可见文本中的独立孤儿标签残片")
+        return result
+
     def _fallback_wrap(self, original_block: str, allow_original: bool = False) -> list:
         """所有修复手段都失败时，清洗为纯文本消息。
 
@@ -1511,20 +1861,26 @@ class XmlTagFixerPlugin(BasePlugin):
             else:
                 logger.debug(f"闸门拦截不可解析块，尝试抢救: {b[:80]}")
                 gated.extend(self._salvage_block(b))
-        fixed_blocks = gated
+        # 最终可见文本闸门：覆盖合法实体文本、末尾散段救回与 fallback 三条来路。
+        # 放在结构修复之后，真正的功能闭合标签已被 XML 元素消费，不会被误当残片。
+        fixed_blocks = self._clean_orphan_debris_blocks(gated)
 
         result = "\n".join(fixed_blocks)
 
         # ---- 总闸门：整轮级别的不变量 ----
         if not self._is_parseable(result):
             logger.warning("最终结果仍不可解析，启用总闸门兜底")
-            return self._last_resort(result)
+            result = self._last_resort(result)
+            if result:
+                # 总闸门自身也必须遵守同一可见残片约定，不能从后门重新带出残片。
+                result = "\n".join(self._clean_orphan_debris_blocks([result]))
         return result
 
     @on.llm_response(priority=Priority.HIGH)
     async def on_llm_response(self, event: KiraMessageBatchEvent, resp: LLMResponse):
         if not self.enabled:
             return
+        self._try_attach_stream_peers()
         if self.only_final and resp.tool_calls:
             return
         if not resp.text_response:
